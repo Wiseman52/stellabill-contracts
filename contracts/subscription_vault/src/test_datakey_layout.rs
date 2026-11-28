@@ -105,6 +105,13 @@ fn test_datakey_discriminants_snapshot() {
         (79, DataKey::OraclePriceHistoryEntry(addr.clone(), 0)),
         (80, DataKey::DelegatedPayerGrant(addr.clone(), addr2.clone())),
         (81, DataKey::SplitPayees(0)),
+        // Restored variants (botched-merge repair) — appended at the end.
+        (82, DataKey::MerchantSubAccount(addr.clone(), Symbol::new(&env, "l"))),
+        (83, DataKey::MerchantSubAccountList(addr.clone())),
+        (84, DataKey::EmergencyWithdrawIntent(0)),
+        (85, DataKey::MerchantVacation(addr.clone())),
+        (86, DataKey::ReentrancyLock(Symbol::new(&env, "l"))),
+        (87, DataKey::TreasurySplit),
     ];
 
     for (expected, key) in cases {
@@ -208,6 +215,12 @@ fn test_datakey_no_duplicate_discriminants() {
         DataKey::OraclePriceHistoryEntry(addr.clone(), 0),
         DataKey::DelegatedPayerGrant(addr.clone(), addr2.clone()),
         DataKey::SplitPayees(0),
+        DataKey::MerchantSubAccount(addr.clone(), Symbol::new(&env, "l")),
+        DataKey::MerchantSubAccountList(addr.clone()),
+        DataKey::EmergencyWithdrawIntent(0),
+        DataKey::MerchantVacation(addr.clone()),
+        DataKey::ReentrancyLock(Symbol::new(&env, "l")),
+        DataKey::TreasurySplit,
     ];
 
     let mut seen = std::collections::HashSet::new();

@@ -43,30 +43,113 @@ mod idempotency;
 mod invariants;
 mod merchant;
 mod metadata;
-mod nonce;
+pub mod nonce;
 pub mod queries;
 mod safe_math;
-mod subscription;
-mod types;
+pub mod subscription;
+pub mod types;
 mod reentrancy;
 mod oracle_adapter;
 mod validation;
 
 pub use admin::CONFIG_COOLDOWN_SECS;
 pub use safe_math::*;
+pub use types::NonceConsumedEvent;
 pub use types::{
     CancellationEscrow, CancellationEscrowDisputedEvent, CancellationEscrowOpenedEvent,
     CancellationEscrowReleasedEvent,
     Dispute, DisputeOpenedEvent, DisputeResolvedEvent, DisputeRespondedEvent,
     DisputeStatus, Error, Proposal, ProposalCancelledEvent,
     ProposalExecutedEvent, ProposalKind, ProposalSubmittedEvent, ProposalVotedEvent,
-    ProtocolFeeConfiguredEvent, EVENT_SCHEMA_VERSION,
+    ProtocolFeeConfiguredEvent, CANCELLATION_ESCROW_WINDOW_SECS, EVENT_SCHEMA_VERSION,
 };
 
 // ── Stub modules for features not yet extracted to separate files ─────────────
 
 /// State machine: validates and applies subscription status transitions.
-pub mod state_machine;
+pub mod state_machine {
+    use crate::types::{Error, SubscriptionStatus};
+
+    /// Documented transition matrix from `docs/subscription_state_machine.md`.
+    ///
+    /// `Cancelled` and `Archived` are terminal states. `InsufficientBalance`
+    /// may return to `Active` only after a successful deposit, and
+    /// `GracePeriod` may return to `Active` via deposit/buyout.
+    static ALLOWED_TRANSITIONS: &[(SubscriptionStatus, &[SubscriptionStatus])] = &[
+        (
+            SubscriptionStatus::Active,
+            &[
+                SubscriptionStatus::Paused,
+                SubscriptionStatus::InsufficientBalance,
+                SubscriptionStatus::Cancelled,
+                SubscriptionStatus::Expired,
+            ],
+        ),
+        (
+            SubscriptionStatus::Paused,
+            &[
+                SubscriptionStatus::Active,
+                SubscriptionStatus::Cancelled,
+                SubscriptionStatus::Expired,
+            ],
+        ),
+        (
+            SubscriptionStatus::InsufficientBalance,
+            &[
+                SubscriptionStatus::Active,
+                SubscriptionStatus::GracePeriod,
+                SubscriptionStatus::Cancelled,
+                SubscriptionStatus::Expired,
+            ],
+        ),
+        (
+            SubscriptionStatus::GracePeriod,
+            &[
+                SubscriptionStatus::Active,
+                SubscriptionStatus::Cancelled,
+                SubscriptionStatus::Expired,
+            ],
+        ),
+        (SubscriptionStatus::Expired, &[SubscriptionStatus::Cancelled]),
+        (SubscriptionStatus::Cancelled, &[] as &[SubscriptionStatus]),
+        (SubscriptionStatus::Archived, &[] as &[SubscriptionStatus]),
+    ];
+
+    /// Returns the documented next states for `status`.
+    pub fn get_allowed_transitions(status: SubscriptionStatus) -> &'static [SubscriptionStatus] {
+        ALLOWED_TRANSITIONS
+            .iter()
+            .find(|(current, _)| *current == status)
+            .map_or(&[], |(_, allowed)| *allowed)
+    }
+
+    /// Returns `true` when the pair is present in the documented transition matrix.
+    pub fn can_transition(current: SubscriptionStatus, next: SubscriptionStatus) -> bool {
+        get_allowed_transitions(current).contains(&next)
+    }
+
+    /// Returns `InvalidStatusTransition` when `current -> next` is not documented.
+    pub fn validate_status_transition(
+        current: SubscriptionStatus,
+        next: SubscriptionStatus,
+    ) -> Result<(), Error> {
+        if can_transition(current, next) {
+            Ok(())
+        } else {
+            Err(Error::InvalidStatusTransition)
+        }
+    }
+
+    /// Applies `next` only if the transition is documented.
+    pub fn transition_to(
+        current: &mut SubscriptionStatus,
+        next: SubscriptionStatus,
+    ) -> Result<(), Error> {
+        validate_status_transition(current.clone(), next.clone())?;
+        *current = next;
+        Ok(())
+    }
+}
 
 /// Period snapshots: immutable per-period billing snapshots.
 pub mod period_snapshots;
@@ -90,279 +173,14 @@ pub mod merchant_api;
 pub mod admin_api;
 
 /// Billing statements: append-only ledger of charges per subscription.
-pub mod statements {
-    #![allow(dead_code)]
-    use crate::types::{
-        AccruedTotals, BillingChargeKind, BillingCompactionSummary, BillingRetentionConfig,
-        BillingStatement, BillingStatementAggregate, BillingStatementsPage, DataKey, Error,
-        BILLING_STATEMENT_TTL_EXTEND_TO, BILLING_STATEMENT_TTL_THRESHOLD,
-    };
-    use soroban_sdk::{Address, Env, Vec};
-
-    /// Extends the TTL of a persistent billing-statement storage entry.
-    ///
-    /// Only extends when the remaining TTL is below `BILLING_STATEMENT_TTL_THRESHOLD`.
-    /// This is a no-op when the key does not exist (the host ignores the call
-    /// for absent keys). Callers must not treat a missing return as an error.
-    pub(crate) fn extend_statement_ttl(env: &Env, key: &DataKey) {
-        env.storage().persistent().extend_ttl(
-            key,
-            BILLING_STATEMENT_TTL_THRESHOLD,
-            BILLING_STATEMENT_TTL_EXTEND_TO,
-        );
-    }
-
-    /// Appends a new, immutable statement to the subscription's ledger under a
-    /// fresh, monotonically-increasing sequence number.
-    ///
-    /// TTL is extended on every write for:
-    /// - `DataKey::BillingStatementSequence(subscription_id)` — the sequence counter.
-    /// - `DataKey::BillingStatement(subscription_id, seq)` — the statement body.
-    /// - `DataKey::BillingStatementsBySubscription(subscription_id)` — the secondary index.
-    pub fn append_statement(
-        env: &Env,
-        subscription_id: u32,
-        amount: i128,
-        merchant: Address,
-        kind: BillingChargeKind,
-        period_start: u64,
-        timestamp: u64,
-    ) -> Result<(), Error> {
-        let seq_key = DataKey::BillingStatementSequence(subscription_id);
-        let seq: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
-        let next_seq = seq.checked_add(1).ok_or(Error::Overflow)?;
-        env.storage().persistent().set(&seq_key, &next_seq);
-        // Extend TTL on the sequence counter so it survives between charges.
-        extend_statement_ttl(env, &seq_key);
-
-        let stmt = BillingStatement {
-            subscription_id,
-            sequence: next_seq,
-            charged_at: timestamp,
-            period_start,
-            period_end: timestamp,
-            amount,
-            merchant,
-            kind,
-        };
-        let stmt_key = DataKey::BillingStatement(subscription_id, next_seq);
-        env.storage().persistent().set(&stmt_key, &stmt);
-        // Extend TTL on the statement body itself.
-        extend_statement_ttl(env, &stmt_key);
-
-        let idx_key = DataKey::BillingStatementsBySubscription(subscription_id);
-        let mut ids: Vec<u32> = env.storage().persistent().get(&idx_key).unwrap_or(Vec::new(env));
-        ids.push_back(next_seq);
-        env.storage().persistent().set(&idx_key, &ids);
-        // Extend TTL on the secondary index so queries remain available.
-        extend_statement_ttl(env, &idx_key);
-
-        Ok(())
-    }
-
-    pub fn set_retention_config(env: &Env, keep_recent: u32) {
-        env.storage()
-            .instance()
-            .set(&DataKey::BillingRetentionConfig, &BillingRetentionConfig { keep_recent });
-    }
-
-    pub fn get_retention_config(env: &Env) -> BillingRetentionConfig {
-        env.storage()
-            .instance()
-            .get(&DataKey::BillingRetentionConfig)
-            .unwrap_or(BillingRetentionConfig { keep_recent: 0 })
-    }
-
-    /// Cumulative totals across every statement ever pruned for this
-    /// subscription (accumulates across multiple `compact_subscription_statements`
-    /// calls; does not include statements still retained).
-    pub fn get_compacted_aggregate(env: &Env, subscription_id: u32) -> BillingStatementAggregate {
-        env.storage()
-            .persistent()
-            .get(&DataKey::BillingStatementAggregate(subscription_id))
-            .unwrap_or(BillingStatementAggregate {
-                pruned_count: 0,
-                total_amount: 0,
-                totals: AccruedTotals { interval: 0, usage: 0, one_off: 0 },
-                oldest_period_start: None,
-                newest_period_end: None,
-            })
-    }
-
-    /// Prunes all but the `keep_recent` most-recently-appended statements for
-    /// `subscription_id` (or `keep_recent_override`, if given), folding each
-    /// pruned statement's amount into the persistent [`BillingStatementAggregate`]
-    /// before deleting it. A no-op (zero-valued summary) when there are no more
-    /// than `keep_recent` statements to begin with — including an empty history.
-    pub fn compact_subscription_statements(
-        env: &Env,
-        subscription_id: u32,
-        keep_recent_override: Option<u32>,
-    ) -> Result<BillingCompactionSummary, Error> {
-        let keep_recent = keep_recent_override.unwrap_or_else(|| get_retention_config(env).keep_recent);
-
-        let idx_key = DataKey::BillingStatementsBySubscription(subscription_id);
-        let ids: Vec<u32> = env.storage().persistent().get(&idx_key).unwrap_or(Vec::new(env));
-        let total = ids.len();
-
-        if total <= keep_recent {
-            return Ok(BillingCompactionSummary {
-                subscription_id,
-                pruned_count: 0,
-                kept_count: total,
-                total_pruned_amount: 0,
-            });
-        }
-
-        let prune_count = total - keep_recent;
-        let mut pruned_amount_total: i128 = 0;
-        let mut pruned_interval: i128 = 0;
-        let mut pruned_usage: i128 = 0;
-        let mut pruned_one_off: i128 = 0;
-        let mut batch_oldest: Option<u64> = None;
-        let mut batch_newest: Option<u64> = None;
-        let mut kept_ids: Vec<u32> = Vec::new(env);
-
-        for i in 0..total {
-            let seq = ids.get(i).unwrap();
-            let stmt_key = DataKey::BillingStatement(subscription_id, seq);
-            if i < prune_count {
-                if let Some(stmt) = env.storage().persistent().get::<_, BillingStatement>(&stmt_key) {
-                    pruned_amount_total = pruned_amount_total.checked_add(stmt.amount).ok_or(Error::Overflow)?;
-                    match stmt.kind {
-                        BillingChargeKind::Interval => {
-                            pruned_interval = pruned_interval.checked_add(stmt.amount).ok_or(Error::Overflow)?;
-                        }
-                        BillingChargeKind::Usage => {
-                            pruned_usage = pruned_usage.checked_add(stmt.amount).ok_or(Error::Overflow)?;
-                        }
-                        BillingChargeKind::OneOff => {
-                            pruned_one_off = pruned_one_off.checked_add(stmt.amount).ok_or(Error::Overflow)?;
-                        }
-                    }
-                    batch_oldest = Some(batch_oldest.map_or(stmt.period_start, |o| o.min(stmt.period_start)));
-                    batch_newest = Some(batch_newest.map_or(stmt.period_end, |n| n.max(stmt.period_end)));
-                }
-                env.storage().persistent().remove(&stmt_key);
-            } else {
-                kept_ids.push_back(seq);
-            }
-        }
-
-        env.storage().persistent().set(&idx_key, &kept_ids);
-
-        let mut agg = get_compacted_aggregate(env, subscription_id);
-        agg.pruned_count = agg.pruned_count.checked_add(prune_count).ok_or(Error::Overflow)?;
-        agg.total_amount = agg.total_amount.checked_add(pruned_amount_total).ok_or(Error::Overflow)?;
-        agg.totals.interval = agg.totals.interval.checked_add(pruned_interval).ok_or(Error::Overflow)?;
-        agg.totals.usage = agg.totals.usage.checked_add(pruned_usage).ok_or(Error::Overflow)?;
-        agg.totals.one_off = agg.totals.one_off.checked_add(pruned_one_off).ok_or(Error::Overflow)?;
-        agg.oldest_period_start = match (agg.oldest_period_start, batch_oldest) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (None, x) => x,
-            (x, None) => x,
-        };
-        agg.newest_period_end = match (agg.newest_period_end, batch_newest) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (None, x) => x,
-            (x, None) => x,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::BillingStatementAggregate(subscription_id), &agg);
-
-        Ok(BillingCompactionSummary {
-            subscription_id,
-            pruned_count: prune_count,
-            kept_count: kept_ids.len(),
-            total_pruned_amount: pruned_amount_total,
-        })
-    }
-
-    /// Returns up to `limit` statements starting at `offset` into the
-    /// subscription's retained (non-pruned) statement list, ordered
-    /// newest-first or oldest-first. `next_cursor` (the next `offset` to
-    /// request) is `Some` iff more statements remain after this page.
-    ///
-    /// TTL is extended on every read for the secondary index and each
-    /// statement body that is fetched, keeping them alive as long as the
-    /// contract is actively queried.
-    pub fn get_statements_by_subscription_offset(
-        env: &Env,
-        subscription_id: u32,
-        offset: u32,
-        limit: u32,
-        newest_first: bool,
-    ) -> Result<BillingStatementsPage, Error> {
-        if limit == 0 {
-            return Err(Error::InvalidInput);
-        }
-
-        let idx_key = DataKey::BillingStatementsBySubscription(subscription_id);
-        let ids: Vec<u32> = env.storage().persistent().get(&idx_key).unwrap_or(Vec::new(env));
-        // Extend TTL on the secondary index entry whenever it is read.
-        if !ids.is_empty() {
-            extend_statement_ttl(env, &idx_key);
-        }
-        let total = ids.len();
-
-        let mut ordered: Vec<u32> = Vec::new(env);
-        if newest_first {
-            let mut i = ids.len();
-            while i > 0 {
-                i -= 1;
-                ordered.push_back(ids.get(i).unwrap());
-            }
-        } else {
-            ordered = ids;
-        }
-
-        let mut statements: Vec<BillingStatement> = Vec::new(env);
-        let end = offset.saturating_add(limit).min(total);
-        let mut i = offset;
-        while i < end {
-            let seq = ordered.get(i).unwrap();
-            let stmt_key = DataKey::BillingStatement(subscription_id, seq);
-            if let Some(stmt) = env
-                .storage()
-                .persistent()
-                .get::<_, BillingStatement>(&stmt_key)
-            {
-                // Extend TTL on each fetched statement body.
-                extend_statement_ttl(env, &stmt_key);
-                statements.push_back(stmt);
-            }
-            i += 1;
-        }
-
-        let next_cursor = if end < total { Some(end) } else { None };
-        Ok(BillingStatementsPage { statements, next_cursor, total })
-    }
-
-    /// Cursor-based pagination over the same ordering as
-    /// [`get_statements_by_subscription_offset`] — `cursor` is simply the
-    /// offset to resume from (`None` starts at the beginning).
-    pub fn get_statements_by_subscription_cursor(
-        env: &Env,
-        subscription_id: u32,
-        cursor: Option<u32>,
-        limit: u32,
-        newest_first: bool,
-    ) -> Result<BillingStatementsPage, Error> {
-        Ok(BillingStatementsPage {
-            statements: soroban_sdk::Vec::new(&env),
-            next_cursor: None,
-            total: 0,
-        })
-    }
-}
+pub mod statements;
 
 
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 pub mod accounting {
     #![allow(unused_variables, dead_code)]
     use crate::types::Error;
-    use soroban_sdk::{Address, Env, Symbol};
+    use soroban_sdk::{Address, Env};
 
     pub fn add_total_accounted(_env: &Env, _token: &Address, _amount: i128) -> Result<(), Error> {
         Ok(())
@@ -384,8 +202,9 @@ pub mod oracle {
 
     /// Resolve the charge amount for a subscription, applying oracle pricing when enabled.
     ///
-    /// When oracle pricing is disabled or the subscription has no cross-currency amount,
-    /// the subscription's own `amount` is returned directly (existing behaviour).
+    /// When oracle pricing is disabled, the subscription's own `amount` is returned directly.
+    /// When enabled, the adapter dispatch routes to Spot, TWAP, or FixedRate and
+    /// converts the subscription's quote-denominated amount to token base units.
     pub fn resolve_charge_amount(
         env: &Env,
         _subscription_id: u32,
@@ -395,10 +214,35 @@ pub mod oracle {
         if !config.enabled {
             return Ok(sub.amount);
         }
-        // When oracle is enabled but we have no cross-currency token pair yet, fall back.
-        // A full integration would extract base/quote addresses from the subscription.
-        // For now this preserves the existing default while the dispatch plumbing is ready.
-        Ok(sub.amount)
+
+        // Use the oracle adapter to dispatch to the correct pricing strategy.
+        // For cross-currency pricing, `sub.token` serves as both base and quote
+        // in the single-token case; the adapter contract returns a price that
+        // is then used to convert the subscription amount.
+        let price = crate::oracle_adapter::dispatch_price(
+            env,
+            &config,
+            &sub.token,
+            &sub.token,
+        )?;
+
+        if price == 0 {
+            return Err(Error::OraclePriceInvalid);
+        }
+
+        // Convert quote amount to token base units:
+        // token_amount = ceil(amount * 10^decimals / price)
+        let token_decimals = crate::admin::get_token_decimals(env, &sub.token).unwrap_or(6);
+        let scale: i128 = 10i128.pow(token_decimals);
+        let numerator = sub.amount.checked_mul(scale).ok_or(Error::Overflow)?;
+        let ceil_adjust = (price as i128).checked_sub(1).ok_or(Error::OraclePriceInvalid)?;
+        let token_amount = (numerator + ceil_adjust) / (price as i128);
+
+        if token_amount <= 0 {
+            return Err(Error::OraclePriceInvalid);
+        }
+
+        Ok(token_amount)
     }
 
     /// Persist oracle configuration. Admin only (caller must have verified auth).
@@ -585,11 +429,18 @@ pub mod operator {
 
     pub fn do_operator_batch_charge(
         env: &Env,
-        _operator: Address,
-        _ids: &Vec<u32>,
-        _nonce: u64,
+        operator: Address,
+        ids: &Vec<u32>,
+        nonce: u64,
     ) -> Result<Vec<BatchChargeResult>, Error> {
-        Ok(Vec::new(env))
+        let stored_op = require_operator_auth(env, &operator)?;
+        crate::nonce::check_and_advance(
+            env,
+            &stored_op,
+            crate::nonce::DOMAIN_OPERATOR_BATCH_CHARGE,
+            nonce,
+        )?;
+        Ok(crate::admin::execute_batch_charge(env, ids))
     }
 
     pub fn do_operator_charge_subscription(
@@ -631,7 +482,8 @@ pub mod operator {
 
 /// Metadata: per-subscription key-value annotations.
 pub use metadata::*;
-pub use subscription::compute_cancel_refund;
+pub use governance::calculate_quorum;
+pub use subscription::{compute_cancel_refund, extend_subscription_ttl};
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 pub use blocklist::{BlocklistAddedEvent, BlocklistEntry, BlocklistRemovedEvent};
@@ -642,8 +494,10 @@ pub use queries::{
 };
 pub use state_machine::{can_transition, get_allowed_transitions, validate_status_transition};
 pub use types::{
-    AcceptedToken, AccruedTotals, AdminProposal, AdminProposalCancelledEvent,
+    is_known_instance_discriminant,    AcceptedToken, AccruedTotals, AdminConfigChangedEvent, AdminProposal,
+    AdminProposalCancelledEvent,
     AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent,
+    ArrearsAccruedEvent, ArrearsSettledEvent,
     BatchChargeResult, BatchWithdrawResult,
     BillingChargeKind, BillingCompactedEvent, BillingCompactionSummary, BillingPeriodSnapshot,
     BillingRetentionConfig, BillingStatement, BillingStatementAggregate, BillingStatementsPage,
@@ -653,7 +507,7 @@ pub use types::{
     LifetimeCapReachedEvent, LifetimeCapUpdatedEvent,
     MerchantBalanceEntry, MerchantCapDefaultUpdatedEvent, MerchantConfig,
     MerchantConfigInitializedEvent, MerchantConfigUpdatedEvent, MerchantFeeOverrideSetEvent,
-    MerchantPausedEvent, MerchantTagsUpdatedEvent, MerchantUnpausedEvent,
+    MerchantPausedEvent, MerchantTagsUpdatedEvent, MerchantUnpausedEvent, MerchantVacation,
     MerchantWithdrawalEvent, MetadataDeletedEvent, MetadataSetEvent, MetadataSetSignedEvent,
     MigrationExportEvent, NextChargeInfo, OneOffChargedEvent, OracleLivenessEvent,
     OracleConfig, OracleKind, OraclePrice, OperatorRemovedEvent, OperatorSetEvent,
@@ -663,33 +517,15 @@ pub use types::{
     ReconciliationSummaryPage, RecoveryEvent, RecoveryReason,
     ReferralAttributedEvent, ScheduledPayoutEvent, SchemaMigratedEvent,
     SignedMetadataPayload, SnapshotExportedEvent, SnapshotRestoredEvent,
-    SplitChargeEvent, SplitPayees,
+    SplitChargeEvent, SplitPayees, SubAccountCreatedEvent, SubAccountWithdrawEvent,
     SubscriberCapReachedEvent, SubscriberCreateWindow, SubscriberWithdrawalEvent,
-    AcceptedToken, AccruedTotals, AdminProposal, AdminProposalCancelledEvent,
-    AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent, BatchChargeResult,
-    BatchWithdrawResult, BillingChargeKind, BillingCompactedEvent, BillingCompactionSummary,
-    BillingPeriodSnapshot, BillingRetentionConfig, BillingStatement, BillingStatementAggregate,
-    BillingStatementsPage, BulkSubscriptionResult, CapInfo, Coupon, DisputeEscrowLedger,
-    ChargeExecutionResult, ContractSnapshot, DataKey, EmergencyStopDisabledEvent,
-    EmergencyStopEnabledEvent, FullSnapshotPage, FundsDepositedEvent, GlobalCapDefaultUpdatedEvent,
-    LifetimeCapReachedEvent, LifetimeCapUpdatedEvent, MerchantBalanceEntry,
-    MerchantCapDefaultUpdatedEvent, MerchantConfig, MerchantConfigInitializedEvent,
-    MerchantConfigUpdatedEvent, MerchantPausedEvent, MerchantUnpausedEvent, MerchantVacation,
-    MerchantWithdrawalEvent, MetadataDeletedEvent, MetadataSetEvent, MetadataSetSignedEvent,
-    MigrationExportEvent, NextChargeInfo, OneOffChargedEvent, OperatorRemovedEvent,
-    OperatorSetEvent, OracleConfig, OracleLivenessEvent, OraclePrice, PartialRefundEvent,
-    PayoutSchedule, PlanTemplate, PlanTemplateUpdatedEvent, PrepaidQueryRequest,
-    PrepaidQueryResult, ProtocolFeeChargedEvent, ReconciliationProof,
-    ReconciliationSummaryPage, SubAccountCreatedEvent, SubAccountWithdrawEvent,
-    RecoveryEvent, RecoveryReason, ScheduledPayoutEvent, SchemaMigratedEvent,
-    SignedMetadataPayload, SnapshotExportedEvent, SnapshotRestoredEvent, SubscriberWithdrawalEvent,
     Subscription, SubscriptionCancelledEvent, SubscriptionChargeFailedEvent,
     SubscriptionChargedEvent, SubscriptionCreatedEvent, SubscriptionMigratedEvent,
     SubscriptionPausedEvent, SubscriptionRecoveryReadyEvent, SubscriptionResumedEvent,
     SubscriptionStatus, SubscriptionSummary,
     TagAllowlistUpdatedEvent, TokenEarnings, TokenLiabilities,
     TokenReconciliationSnapshot, UsageChargeResult, UsageLimits, UsageState, UsageStatementEvent,
-    DEFAULT_ALLOWED_OPS, DISPUTE_WINDOW_SECS, EVENT_SCHEMA_VERSION, MAX_MERCHANT_TAGS,
+    DEFAULT_ALLOWED_OPS, DISPUTE_WINDOW_SECS, MAX_MERCHANT_TAGS,
     MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
     OP_AUTO_RENEWAL, OP_BILLING_PAUSE, OP_CHARGE, OP_REFUND, OP_WITHDRAW,
     SNAPSHOT_FLAG_CLOSED, SNAPSHOT_FLAG_EMPTY, SNAPSHOT_FLAG_INTERVAL_CHARGED,
@@ -706,7 +542,11 @@ pub const MAX_SUBSCRIPTION_ID: u32 = u32::MAX;
 /// field. Existing live `DataKey::Sub(id)` records were serialized without this
 /// trailing field; the `v3 → v4` step in [`admin::do_migrate`] walks every
 /// subscription record and rewrites it so the new field deserializes cleanly.
-const STORAGE_VERSION: u32 = 5;
+///
+/// Bumped to **6** when [`Subscription`] gained the trailing `arrears: i128`
+/// field (issue #942); the `v5 → v6` step in [`admin::do_migrate`] rewrites
+/// every subscription record so the new field deserializes cleanly.
+const STORAGE_VERSION: u32 = 6;
 
 /// Hard upper bound on the number of subscriptions that may be exported in a single call.
 const MAX_EXPORT_LIMIT: u32 = 100;
@@ -1130,6 +970,7 @@ impl SubscriptionVault {
         Ok(())
     }
 
+
     // ── Migration / Export ────────────────────────────────────────────────────
 
     /// Run the schema migration entry point. Admin only.
@@ -1390,6 +1231,7 @@ impl SubscriptionVault {
                     sub_account_label: None,
                     auto_renew: true,
                     auto_renew_disabled_at: None,
+                    arrears: 0,
                 };
                 env.storage()
                     .persistent()
@@ -1520,6 +1362,8 @@ impl SubscriptionVault {
             usage_enabled,
             lifetime_cap,
             expires_at,
+            None, // expires_at_ledger (not exposed on split-payee creation)
+            None, // sub_account_label (not exposed on split-payee creation)
         )?;
 
         let split = SplitPayees {
@@ -1540,6 +1384,7 @@ impl SubscriptionVault {
                 interval_seconds,
                 lifetime_cap,
                 expires_at,
+                expires_at_ledger: None,
                 timestamp: env.ledger().timestamp(),
                 schema_version: crate::types::EVENT_SCHEMA_VERSION,
             },
@@ -1954,13 +1799,13 @@ impl SubscriptionVault {
     /// `None`, with `previous_expires_at_ledger` set to the prior bound so
     /// indexers can reconstruct the lifecycle).
     #[allow(clippy::too_many_arguments)]
-    pub fn set_subscription_expiration_ledger(
+    pub fn set_sub_expiration_ledger(
         env: Env,
         subscription_id: u32,
         authorizer: Address,
         expires_at_ledger: Option<u32>,
     ) -> Result<(), Error> {
-        subscription::do_set_subscription_expiration_ledger(
+        subscription::do_set_sub_exp_ledger(
             &env,
             subscription_id,
             authorizer,
@@ -2144,7 +1989,7 @@ impl SubscriptionVault {
         subscription::do_pause_subscription(&env, subscription_id, authorizer.clone())?;
         let timestamp = env.ledger().timestamp();
 
-        let sub = queries::get_subscription(&env, subscription_id)?;
+        let _sub = queries::get_subscription(&env, subscription_id)?;
         env.events().publish(
             (Symbol::new(&env, "sub_paused"), subscription_id),
             SubscriptionPausedEvent {
@@ -2330,48 +2175,24 @@ impl SubscriptionVault {
         subscription_id: u32,
         idem_key: Option<soroban_sdk::BytesN<32>>,
     ) -> Result<ChargeExecutionResult, Error> {
+        // Admin-only: only the stored admin (billing engine) may trigger charges
+        // that move funds from subscriber vaults to merchant earnings.
+        let _admin = admin::require_stored_admin_auth(&env)?;
         require_not_emergency_stop(&env)?;
         let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "charge_subscription")?;
-        let old_sub = queries::get_subscription(&env, subscription_id)?;
         let timestamp = env.ledger().timestamp();
-        let result = charge_core::charge_one(&env, subscription_id, timestamp, idem_key, None)?;
-        let new_sub = queries::get_subscription(&env, subscription_id)?;
-
-        let _period_start = old_sub.last_payment_timestamp;
-        let _period_end = timestamp;
-
-        env.events().publish(
-            (types::TOPIC_CHARGED,),
-            SubscriptionChargedEvent {
-                subscription_id,
-                subscriber: old_sub.subscriber,
-                merchant: old_sub.merchant,
-                token: old_sub.token,
-                amount: old_sub.amount,
-                lifetime_charged: new_sub.lifetime_charged,
-                timestamp,
-                period_start: old_sub.last_payment_timestamp,
-                period_end: timestamp,
-                salt: {
-                    let mut salt_buf = [0u8; 20];
-                    salt_buf[..4].copy_from_slice(&subscription_id.to_be_bytes());
-                    salt_buf[4..12].copy_from_slice(&old_sub.last_payment_timestamp.to_be_bytes());
-                    salt_buf[12..20].copy_from_slice(&env.ledger().sequence().to_be_bytes());
-                    let salt_input = soroban_sdk::Bytes::from_slice(&env, &salt_buf);
-                    env.crypto().sha256(&salt_input).into()
-                },
-                schema_version: crate::types::EVENT_SCHEMA_VERSION,
-            },
-        );
-        Ok(result)
+        charge_core::charge_one(&env, subscription_id, timestamp, idem_key, None)
     }
 
-    /// Charge metered usage.
+    /// Charge metered usage. Admin only.
     pub fn charge_usage(
         env: Env,
         subscription_id: u32,
         usage_amount: i128,
     ) -> Result<UsageChargeResult, Error> {
+        // Admin-only: only the stored admin (billing engine) may trigger charges
+        // that move funds from subscriber vaults to merchant earnings.
+        let _admin = admin::require_stored_admin_auth(&env)?;
         require_not_emergency_stop(&env)?;
         let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "charge_usage")?;
         charge_core::charge_usage_one(
@@ -2382,13 +2203,16 @@ impl SubscriptionVault {
         )
     }
 
-    /// Charge usage with reference.
+    /// Charge usage with reference. Admin only.
     pub fn charge_usage_with_reference(
         env: Env,
         subscription_id: u32,
         usage_amount: i128,
         reference: String,
     ) -> Result<UsageChargeResult, Error> {
+        // Admin-only: only the stored admin (billing engine) may trigger charges
+        // that move funds from subscriber vaults to merchant earnings.
+        let _admin = admin::require_stored_admin_auth(&env)?;
         require_not_emergency_stop(&env)?;
         let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "charge_usage_with_reference")?;
         charge_core::charge_usage_one(&env, subscription_id, usage_amount, reference)
@@ -2522,6 +2346,39 @@ impl SubscriptionVault {
     /// Returns `true` if the merchant is currently within a vacation window.
     pub fn is_merchant_in_vacation(env: Env, merchant: Address, now: u64) -> bool {
         merchant::is_merchant_in_vacation(&env, &merchant, now)
+    }
+
+    // ── Merchant allowlist mode ────────────────────────────────────────────────
+
+    /// Enable or disable merchant allowlist mode (admin only).
+    pub fn set_whitelist_mode(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
+        merchant::set_whitelist_mode(&env, admin, enabled)
+    }
+
+    /// Returns `true` if merchant allowlist mode is enabled.
+    pub fn get_whitelist_mode(env: Env) -> bool {
+        merchant::get_whitelist_mode(&env)
+    }
+
+    /// Approve a merchant under allowlist mode (admin only).
+    pub fn approve_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        merchant::approve_merchant(&env, admin, merchant)
+    }
+
+    /// Revoke a merchant approval under allowlist mode (admin only).
+    pub fn revoke_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        merchant::revoke_merchant(&env, admin, merchant)
+    }
+
+    /// Returns `true` if the merchant is approved under allowlist mode.
+    pub fn is_merchant_approved(env: Env, merchant: Address) -> bool {
+        merchant::is_merchant_approved(&env, &merchant)
+    }
+
+    /// Set the consecutive-failure auto-pause threshold (admin only).
+    /// `0` disables auto-pause.
+    pub fn set_auto_pause_threshold(env: Env, admin: Address, threshold: u32) -> Result<(), Error> {
+        admin::do_set_auto_pause_threshold(&env, admin, threshold)
     }
 
     /// direct merchant refund to subscriber.
@@ -3116,7 +2973,11 @@ impl SubscriptionVault {
         key: String,
         value: String,
     ) -> Result<(), Error> {
-        validation::reject_empty_string(&key)?;
+        // Value must not be empty or whitespace-only; an empty value is a
+        // degenerate write that should not reach storage.
+        // Key emptiness / length is handled in apply_metadata_value which
+        // returns MetadataKeyTooLong (3005) for an empty or over-length key,
+        // giving callers a precise, actionable error code.
         validation::reject_empty_string(&value)?;
         metadata::set_metadata(&env, subscription_id, &authorizer, key, value)
     }
@@ -3254,6 +3115,33 @@ impl SubscriptionVault {
     /// Get protocol fee bps.
     pub fn get_protocol_fee_bps(env: Env) -> u32 {
         admin::get_protocol_fee_bps(&env)
+    }
+
+    /// Set a multi-beneficiary treasury split for protocol fee routing.
+    ///
+    /// When configured, protocol fees are distributed across the listed
+    /// beneficiaries according to their basis-point allocation instead of
+    /// being sent to the single treasury address.
+    ///
+    /// The sum of all `bps` values must equal exactly 10_000. Duplicate
+    /// beneficiaries are rejected. Each entry must have `bps > 0`.
+    pub fn set_treasury_split(
+        env: Env,
+        admin: Address,
+        entries: Vec<types::TreasurySplitEntry>,
+    ) -> Result<(), Error> {
+        admin::set_treasury_split(&env, admin, entries)
+    }
+
+    /// Get the configured treasury split, or `None` if not set.
+    pub fn get_treasury_split(env: Env) -> Option<types::TreasurySplitConfig> {
+        admin::get_treasury_split(&env)
+    }
+
+    /// Clear the treasury split, reverting protocol fees to the single
+    /// treasury address. Admin only.
+    pub fn clear_treasury_split(env: Env, admin: Address) -> Result<(), Error> {
+        admin::clear_treasury_split(&env, admin)
     }
 
     // ── Governance (Quorum-based proposals) ──────────────────────────────────
@@ -3458,6 +3346,7 @@ impl SubscriptionVault {
         new_fee_address: Option<Option<Address>>,
         new_redirect_url: Option<String>,
         new_is_paused: Option<bool>,
+        new_allow_partial_payment: Option<bool>,
     ) -> Result<MerchantConfig, Error> {
         merchant::update_merchant_config(
             &env,
@@ -3469,6 +3358,7 @@ impl SubscriptionVault {
             new_fee_address,
             new_redirect_url,
             new_is_paused,
+            new_allow_partial_payment,
         )
     }
 
@@ -3492,6 +3382,8 @@ impl SubscriptionVault {
             .get(&DataKey::NextId)
             .unwrap_or(0u32)
     }
+
+
 
     /// Internal ID allocator.
     fn _next_id(env: &Env) -> Result<u32, Error> {
@@ -3517,10 +3409,18 @@ mod test_utils;
 mod test_cancellation_escrow;
 
 #[cfg(test)]
+mod test_do_respond_dispute;
+
+#[cfg(test)]
+mod test_do_get_subscription_dispute;
+
+#[cfg(test)]
 mod test_usage_limits_required;
 
 #[cfg(test)]
 mod test_charge_invariants;
+#[cfg(test)]
+mod test_charge_core_adversarial;
 #[cfg(test)]
 mod test_metadata_signed;
 
@@ -3529,10 +3429,15 @@ mod test_scheduled_cancel;
 #[cfg(test)]
 mod test_subscriber_active_cap;
 #[cfg(test)]
+mod test_subscriber_create_cap;
+#[cfg(test)]
 mod test_statement_compaction;
 
 #[cfg(test)]
 mod test_ttl_billing_statements;
+
+#[cfg(test)]
+mod test_billing_statements_impl;
 
 #[cfg(test)]
 mod test_billing_period_snapshots;
@@ -3541,6 +3446,8 @@ mod test_merchant_full_drain;
 
 #[cfg(test)]
 mod test_validation;
+#[cfg(test)]
+mod test_admin_require_auth_adversarial;
 
 #[cfg(test)]
 mod test_emergency_withdraw;
@@ -3548,16 +3455,36 @@ mod test_emergency_withdraw;
 #[cfg(test)]
 mod test_abi_validators_integration;
 #[cfg(test)]
+mod test_remove_guardian;
+#[cfg(test)]
 mod test_coupon;
+#[cfg(test)]
+mod test_compute_discount_adversarial;
+
+#[cfg(test)]
+mod test_admin_rotation_two_step;
 
 #[cfg(test)]
 mod test_bulk_admin_ops;
 
 #[cfg(test)]
+mod test_get_schema_version;
+
+#[cfg(test)]
 mod test_auto_pause;
+#[cfg(test)]
+mod test_auto_pause_threshold;
+
+#[cfg(test)]
+mod test_admin_auto_pause_threshold;
+
+#[cfg(test)]
+mod test_admin_get_token;
 
 #[cfg(test)]
 mod test_grace_buyout;
+#[cfg(test)]
+mod test_get_buyout_premium_bps;
 
 #[cfg(test)]
 mod test_subscription_transfer;
@@ -3579,12 +3506,88 @@ mod test_merchant_whitelist;
 mod test_split_billing;
 
 #[cfg(test)]
-mod test_split_billing;
-
-#[cfg(test)]
 mod test_merchant_vacation;
 
 #[cfg(test)]
 mod test_emergency_stop_view_surface;
 #[cfg(test)]
 mod test_protocol_fee_routing;
+#[cfg(test)]
+mod test_do_vote_proposal;
+#[cfg(test)]
+mod test_treasury_split;
+#[cfg(test)]
+mod test_admin_treasury_change;
+#[cfg(test)]
+mod test_operator;
+
+#[cfg(test)]
+mod revoke_merchant_adversarial_tests {
+    use super::{Error, SubscriptionVault, SubscriptionVaultClient};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env};
+
+    fn setup() -> (Env, SubscriptionVaultClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        client.init(&token, &6, &admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+        (env, client, admin)
+    }
+
+    #[test]
+    fn admin_revokes_approval_and_repeated_revoke_is_stable() {
+        let (env, client, admin) = setup();
+        let merchant = Address::generate(&env);
+        client.approve_merchant(&admin, &merchant);
+        assert!(client.is_merchant_approved(&merchant));
+
+        client.revoke_merchant(&admin, &merchant);
+        assert!(!client.is_merchant_approved(&merchant));
+
+        client.revoke_merchant(&admin, &merchant);
+        assert!(!client.is_merchant_approved(&merchant));
+    }
+
+    #[test]
+    fn wrong_admin_cannot_revoke_or_change_approval() {
+        let (env, client, admin) = setup();
+        let merchant = Address::generate(&env);
+        let wrong_admin = Address::generate(&env);
+        client.approve_merchant(&admin, &merchant);
+
+        assert_eq!(
+            client.try_revoke_merchant(&wrong_admin, &merchant),
+            Err(Ok(Error::Forbidden))
+        );
+        assert!(client.is_merchant_approved(&merchant));
+    }
+
+    #[test]
+    fn revoke_in_uninitialized_environment_fails_without_approval_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        assert_eq!(
+            client.try_revoke_merchant(&admin, &merchant),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert!(!client.is_merchant_approved(&merchant));
+    }
+}
+mod test_do_charge_subscription;
+
+#[cfg(test)]
+mod test_blocklist_is_blocklisted;
+
+#[cfg(test)]
+mod test_do_propose_admin;

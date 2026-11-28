@@ -4,7 +4,8 @@
 //! or contract entrypoints.
 
 use soroban_sdk::{
-    contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, String, Symbol,
+    Vec,
 };
 
 /// Current schema version for contract events.
@@ -248,40 +249,50 @@ pub enum DataKey {
     ChargeFailureCounter(u32),
     /// Auto-pause threshold (consecutive failures before auto-pause). Discriminant 66.
     AutoPauseThreshold,
-    /// Delegated payer grant keyed by (subscriber, payer). Discriminant 79.
-    DelegatedPayerGrant(Address, Address),
-    /// Split payees details for split-billing. Discriminant 80.
-    SplitPayees(u32),
-    /// Buyout premium in basis points for grace-period recovery. Discriminant 67.
+    /// Buyout premium in basis points for grace-period recovery. Discriminant 68.
     BuyoutPremiumBps,
-    /// Merchant vacation window storing (start_ts, end_ts). Discriminant 62.
-    MerchantVacation(Address),
-    /// Coupon code bound to a subscription (persistent). Discriminant 68.
+    /// Coupon code bound to a subscription (persistent). Discriminant 69.
     SubCoupon(u32),
-    /// Per-merchant multi-sig withdrawal quorum config (instance). Discriminant 69.
+    /// Per-merchant multi-sig withdrawal quorum config (instance). Discriminant 70.
     MerchantMultiSig(Address),
-    /// Count of a subscriber's currently-`Active` subscriptions (instance). Discriminant 70.
+    /// Count of a subscriber's currently-`Active` subscriptions (instance). Discriminant 71.
     SubscriberActiveCount(Address),
-    /// Admin override of a subscriber's active-subscription cap (instance). Discriminant 71.
+    /// Admin override of a subscriber's active-subscription cap (instance). Discriminant 72.
     SubscriberActiveCapOverride(Address),
     /// Admin-controlled allowlist of valid merchant compliance-category tags (instance,
-    /// global). Discriminant 72.
+    /// global). Discriminant 73.
     TagAllowlist,
     /// Compliance-category tags assigned to a merchant, capped at `MAX_MERCHANT_TAGS`
-    /// (instance). Discriminant 73.
+    /// (instance). Discriminant 74.
     MerchantTags(Address),
     /// Optional fee-token override: when set, protocol fees are paid in this
     /// token instead of the subscription's settlement token, converted through
-    /// the oracle at charge time. Discriminant 74.
+    /// the oracle at charge time. Discriminant 75.
     FeeToken,
-    /// Cancellation refund escrow record keyed by subscription ID. Discriminant 75.
+    /// Cancellation refund escrow record keyed by subscription ID. Discriminant 76.
     CancellationEscrow(u32),
-    /// Per-merchant protocol-fee override in basis points (instance). Discriminant 76.
+    /// Per-merchant protocol-fee override in basis points (instance). Discriminant 77.
     MerchantFeeBps(Address),
-    /// Per-token oracle price history ring-buffer metadata (instance). Discriminant 77.
+    /// Per-token oracle price history ring-buffer metadata (instance). Discriminant 78.
     OraclePriceHistoryMeta(Address),
-    /// Per-token oracle price history ring-buffer entry (instance). Discriminant 78.
+    /// Per-token oracle price history ring-buffer entry (instance). Discriminant 79.
     OraclePriceHistoryEntry(Address, u32),
+    /// Delegated payer grant keyed by (subscriber, payer). Discriminant 80.
+    DelegatedPayerGrant(Address, Address),
+    /// Split payees details for split-billing. Discriminant 81.
+    SplitPayees(u32),
+    /// Merchant sub-account balance keyed by (merchant, label) (instance). Discriminant 82.
+    MerchantSubAccount(Address, Symbol),
+    /// List of registered sub-account labels for a merchant (instance). Discriminant 83.
+    MerchantSubAccountList(Address),
+    /// Subscriber emergency-withdrawal intent keyed by subscription ID (persistent). Discriminant 84.
+    EmergencyWithdrawIntent(u32),
+    /// Merchant vacation window storing (start_ts, end_ts) (instance). Discriminant 85.
+    MerchantVacation(Address),
+    /// Per-entrypoint reentrancy lock flag (instance). Discriminant 86.
+    ReentrancyLock(Symbol),
+    /// Multi-beneficiary treasury split configuration. Discriminant 87.
+    TreasurySplit,
 }
 
 impl DataKey {
@@ -343,34 +354,39 @@ impl DataKey {
             DataKey::SubscriptionDispute(_) => 52,
             DataKey::PayoutSchedule(_) => 53,
             DataKey::PendingTreasuryChange => 54,
-            DataKey::TransferIntent(_) => 54,
-            DataKey::Kyc(_) => 55,
-            DataKey::Coupon(_) => 56,
-            DataKey::CouponRedemptions(_) => 57,
-            DataKey::Credential(_) => 58,
-            DataKey::SplitPayees(_) => 59,
-            DataKey::BuyoutPremiumBps => 60,
-            DataKey::MerchantVacation(_) => 62,
-            DataKey::AdminConfigLastChangedAt(_) => 59,
-            DataKey::SubscriberCreateCap => 60,
-            DataKey::SubscriberCreateWindow(_) => 61,
-            DataKey::MerchantWhitelistMode => 62,
-            DataKey::MerchantApproved(_) => 63,
-            DataKey::ChargeSalt(_) => 64,
-            DataKey::ChargeFailureCounter(_) => 65,
-            DataKey::AutoPauseThreshold => 66,
-            DataKey::BuyoutPremiumBps => 67,
-            DataKey::SubCoupon(_) => 68,
-            DataKey::MerchantMultiSig(_) => 69,
-            DataKey::SubscriberActiveCount(_) => 70,
-            DataKey::SubscriberActiveCapOverride(_) => 71,
-            DataKey::TagAllowlist => 72,
-            DataKey::MerchantTags(_) => 73,
-            DataKey::FeeToken => 74,
-            DataKey::CancellationEscrow(_) => 75,
-            DataKey::MerchantFeeBps(_) => 76,
-            DataKey::OraclePriceHistoryMeta(_) => 77,
-            DataKey::OraclePriceHistoryEntry(_, _) => 78,
+            DataKey::TransferIntent(_) => 55,
+            DataKey::Kyc(_) => 56,
+            DataKey::Coupon(_) => 57,
+            DataKey::CouponRedemptions(_) => 58,
+            DataKey::Credential(_) => 59,
+            DataKey::AdminConfigLastChangedAt(_) => 60,
+            DataKey::SubscriberCreateCap => 61,
+            DataKey::SubscriberCreateWindow(_) => 62,
+            DataKey::MerchantWhitelistMode => 63,
+            DataKey::MerchantApproved(_) => 64,
+            DataKey::ChargeSalt(_) => 65,
+            DataKey::ChargeFailureCounter(_) => 66,
+            DataKey::AutoPauseThreshold => 67,
+            DataKey::BuyoutPremiumBps => 68,
+            DataKey::SubCoupon(_) => 69,
+            DataKey::MerchantMultiSig(_) => 70,
+            DataKey::SubscriberActiveCount(_) => 71,
+            DataKey::SubscriberActiveCapOverride(_) => 72,
+            DataKey::TagAllowlist => 73,
+            DataKey::MerchantTags(_) => 74,
+            DataKey::FeeToken => 75,
+            DataKey::CancellationEscrow(_) => 76,
+            DataKey::MerchantFeeBps(_) => 77,
+            DataKey::OraclePriceHistoryMeta(_) => 78,
+            DataKey::OraclePriceHistoryEntry(_, _) => 79,
+            DataKey::DelegatedPayerGrant(_, _) => 80,
+            DataKey::SplitPayees(_) => 81,
+            DataKey::MerchantSubAccount(_, _) => 82,
+            DataKey::MerchantSubAccountList(_) => 83,
+            DataKey::EmergencyWithdrawIntent(_) => 84,
+            DataKey::MerchantVacation(_) => 85,
+            DataKey::ReentrancyLock(_) => 86,
+            DataKey::TreasurySplit => 87,
         }
     }
 
@@ -420,28 +436,30 @@ pub const KNOWN_INSTANCE_KEY_DISCRIMINANTS: &[u32] = &[
     51, // NextDisputeId
     52, // SubscriptionDispute(u32)
     53, // PayoutSchedule(Address)
-    54, // TransferIntent(u32)
-    59, // BuyoutPremiumBps
-    61, // MerchantMultiSig(Address)
-    62, // MerchantVacation(Address)
-    59, // AdminConfigLastChangedAt(BytesN<32>)
-    60, // SubscriberCreateCap
-    61, // SubscriberCreateWindow(Address)
-    62, // MerchantWhitelistMode
-    63, // MerchantApproved(Address)
-    64, // ChargeSalt(u32)
-    65, // ChargeFailureCounter(u32)
-    66, // AutoPauseThreshold
-    67, // BuyoutPremiumBps
-    69, // MerchantMultiSig(Address)
-    70, // SubscriberActiveCount(Address)
-    71, // SubscriberActiveCapOverride(Address)
-    72, // TagAllowlist
-    73, // MerchantTags(Address)
-    74, // FeeToken
-    76, // MerchantFeeBps(Address)
-    77, // OraclePriceHistoryMeta(Address)
-    78, // OraclePriceHistoryEntry(Address, u32)
+    54, // PendingTreasuryChange
+    60, // AdminConfigLastChangedAt(BytesN<32>)
+    61, // SubscriberCreateCap
+    62, // SubscriberCreateWindow(Address)
+    63, // MerchantWhitelistMode
+    64, // MerchantApproved(Address)
+    65, // ChargeSalt(u32)
+    66, // ChargeFailureCounter(u32)
+    67, // AutoPauseThreshold
+    68, // BuyoutPremiumBps
+    70, // MerchantMultiSig(Address)
+    71, // SubscriberActiveCount(Address)
+    72, // SubscriberActiveCapOverride(Address)
+    73, // TagAllowlist
+    74, // MerchantTags(Address)
+    75, // FeeToken
+    77, // MerchantFeeBps(Address)
+    78, // OraclePriceHistoryMeta(Address)
+    79, // OraclePriceHistoryEntry(Address, u32)
+    82, // MerchantSubAccount(Address, Symbol)
+    83, // MerchantSubAccountList(Address)
+    85, // MerchantVacation(Address)
+    86, // ReentrancyLock(Symbol)
+    87, // TreasurySplit
 ];
 
 /// Returns `true` if `discriminant` is a recognised instance-storage key.
@@ -491,9 +509,185 @@ pub enum SubscriptionStatus {
     Archived = 6,
 }
 
+/// Allowed subscription status transitions, mirroring the state machine
+/// documented in `docs/subscription_state_machine.md`.
+///
+/// `Cancelled` and `Archived` are terminal states and intentionally have no
+/// outgoing entries. `InsufficientBalance -> Active` is reserved for
+/// deposit-funded recovery; callers must also verify that a deposit occurred
+/// before invoking this transition.
+pub const ALLOWED_STATUS_TRANSITIONS: &[(SubscriptionStatus, &[SubscriptionStatus])] = &[
+    (
+        SubscriptionStatus::Active,
+        &[
+            SubscriptionStatus::Paused,
+            SubscriptionStatus::InsufficientBalance,
+            SubscriptionStatus::GracePeriod,
+            SubscriptionStatus::Expired,
+            SubscriptionStatus::Cancelled,
+        ],
+    ),
+    (
+        SubscriptionStatus::Paused,
+        &[
+            SubscriptionStatus::Active,
+            SubscriptionStatus::Expired,
+            SubscriptionStatus::Cancelled,
+        ],
+    ),
+    (
+        SubscriptionStatus::InsufficientBalance,
+        &[
+            SubscriptionStatus::Active,
+            SubscriptionStatus::Expired,
+            SubscriptionStatus::Cancelled,
+        ],
+    ),
+    (
+        SubscriptionStatus::GracePeriod,
+        &[
+            SubscriptionStatus::Active,
+            SubscriptionStatus::Expired,
+            SubscriptionStatus::Cancelled,
+        ],
+    ),
+    (
+        SubscriptionStatus::Expired,
+        &[
+            SubscriptionStatus::Cancelled,
+            SubscriptionStatus::Archived,
+        ],
+    ),
+];
+
+impl SubscriptionStatus {
+    /// Returns `true` when the transition `self -> next` is in the documented
+    /// transition matrix.
+    pub fn can_transition_to(self, next: SubscriptionStatus) -> bool {
+        ALLOWED_STATUS_TRANSITIONS
+            .iter()
+            .find(|(from, _)| *from == self)
+            .map(|(_, allowed)| allowed.contains(&next))
+            .unwrap_or(false)
+    }
+
+    /// Alias matching the `state_machine` module's `can_transition` API.
+    pub fn can_transition(self, next: SubscriptionStatus) -> bool {
+        self.can_transition_to(next)
+    }
+
+    /// Validates a status transition, returning
+    /// [`Error::InvalidStatusTransition`] when the matrix does not permit it.
+    pub fn validate_status_transition(self, next: SubscriptionStatus) -> Result<(), Error> {
+        if self.can_transition_to(next) {
+            Ok(())
+        } else {
+            Err(Error::InvalidStatusTransition)
+        }
+    }
+}
+
+/// Validates a status transition using the documented matrix.
+pub fn validate_status_transition(
+    from: SubscriptionStatus,
+    to: SubscriptionStatus,
+) -> Result<(), Error> {
+    from.validate_status_transition(to)
+}
+
+/// Returns `true` when the `from -> to` transition is in the documented matrix,
+/// including same-state no-ops for idempotent callers.
+pub fn can_transition(from: SubscriptionStatus, to: SubscriptionStatus) -> bool {
+    from == to || from.can_transition_to(to)
+}
+
+/// Applies a transition only when the matrix permits it. Same-state calls are
+/// accepted as idempotent no-ops.
+pub fn transition_to(current: &mut SubscriptionStatus, next: SubscriptionStatus) -> Result<(), Error> {
+    if *current == next {
+        return Ok(());
+    }
+    validate_status_transition(*current, next)?;
+    *current = next;
+    Ok(())
+}
+
+#[cfg(test)]
+mod status_transition_tests {
+    use super::{can_transition, transition_to, Error, SubscriptionStatus};
+
+    #[test]
+    fn documented_happy_paths_are_allowed() {
+        use SubscriptionStatus::*;
+        assert!(Active.can_transition_to(Paused));
+        assert!(Active.can_transition_to(InsufficientBalance));
+        assert!(Active.can_transition_to(GracePeriod));
+        assert!(Active.can_transition_to(Expired));
+        assert!(Active.can_transition_to(Cancelled));
+        assert!(Paused.can_transition_to(Active));
+        assert!(Paused.can_transition_to(Expired));
+        assert!(Paused.can_transition_to(Cancelled));
+        assert!(InsufficientBalance.can_transition_to(Active));
+        assert!(InsufficientBalance.can_transition_to(Expired));
+        assert!(InsufficientBalance.can_transition_to(Cancelled));
+        assert!(GracePeriod.can_transition_to(Active));
+        assert!(GracePeriod.can_transition_to(Expired));
+        assert!(GracePeriod.can_transition_to(Cancelled));
+        assert!(Expired.can_transition_to(Cancelled));
+        assert!(Expired.can_transition_to(Archived));
+    }
+
+    #[test]
+    fn terminal_states_are_enforced() {
+        use SubscriptionStatus::*;
+        for next in [
+            Active,
+            Paused,
+            Cancelled,
+            InsufficientBalance,
+            GracePeriod,
+            Expired,
+            Archived,
+        ] {
+            assert!(!Cancelled.can_transition_to(next));
+            assert!(!Archived.can_transition_to(next));
+        }
+    }
+
+    #[test]
+    fn invalid_transitions_return_error() {
+        use SubscriptionStatus::*;
+        assert_eq!(
+            Active.validate_status_transition(Archived),
+            Err(Error::InvalidStatusTransition)
+        );
+        assert_eq!(
+            Cancelled.validate_status_transition(Active),
+            Err(Error::InvalidStatusTransition)
+        );
+        assert_eq!(
+            Expired.validate_status_transition(Active),
+            Err(Error::InvalidStatusTransition)
+        );
+    }
+
+    #[test]
+    fn same_state_noop_is_allowed() {
+        use SubscriptionStatus::*;
+        assert!(can_transition(Active, Active));
+        let mut status = Active;
+        assert!(transition_to(&mut status, Active).is_ok());
+        assert_eq!(status, Active);
+        status = Cancelled;
+        assert!(transition_to(&mut status, Cancelled).is_ok());
+        assert_eq!(status, Cancelled);
+        assert!(transition_to(&mut status, Active).is_err());
+    }
+}
+
 /// Stores subscription details and current state.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
     pub subscriber: Address,
     pub merchant: Address,
@@ -539,6 +733,12 @@ pub struct Subscription {
     /// enforce the one-interval renewal window. `None` when auto-renewal is
     /// enabled or has never been disabled.
     pub auto_renew_disabled_at: Option<u64>,
+    /// Outstanding arrears (unpaid shortfall) accumulated when a partial payment
+    /// drained the prepaid balance but did not cover the full charge amount.
+    ///
+    /// Arrears are always `>= 0`. Any deposit is applied to arrears *before*
+    /// it tops up the prepaid balance (see `do_deposit_funds`).
+    pub arrears: i128,
 }
 
 impl Subscription {
@@ -937,6 +1137,16 @@ pub enum Error {
     CooldownActive = 4012,
     /// Merchant vacation mode is active — charges blocked during vacation window.
     VacationActive = 4014,
+    /// Subscriber requested an emergency withdrawal while one is already in progress.
+    EmergencyWithdrawCooldownActive = 4015,
+    /// No emergency-withdrawal intent exists for this subscription.
+    EmergencyWithdrawNotRequested = 4016,
+    /// The emergency-withdrawal intent state was changed concurrently.
+    EmergencyWithdrawStateChanged = 4017,
+    /// Emergency withdrawal is not allowed from the current subscription state.
+    EmergencyWithdrawInvalidState = 4018,
+    /// A referral/rebate cannot target the subscriber themselves.
+    SelfReferralNotAllowed = 4019,
 
     // --- Accounting (5000-5099) ---
     /// Insufficient balance in the subscription vault.
@@ -1084,6 +1294,7 @@ pub enum Error {
     EscrowNotFound = 15001,
     /// The cancellation escrow release window has not elapsed yet.
     EscrowNotReleased = 15002,
+
 }
 
 impl Error {
@@ -1091,6 +1302,54 @@ impl Error {
     pub const fn to_code(self) -> u32 {
         self as u32
     }
+}
+
+/// Normalize a raw token amount to 9-decimal internal representation.
+///
+/// Reads the token's decimals from `DataKey::TokenDecimals` and scales the
+/// amount up by `10^(9 - decimals)`. Returns an error if the token is not
+/// registered, has zero decimals, more than 9 decimals, or if the scaling
+/// would overflow.
+pub fn normalize_amount(env: &Env, token: &Address, raw: i128) -> Result<i128, Error> {
+    let decimals: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenDecimals(token.clone()))
+        .ok_or(Error::InvalidToken)?;
+    if decimals == 0 {
+        return Err(Error::InvalidTokenDecimals);
+    }
+    if decimals > 9 {
+        return Err(Error::InvalidInput);
+    }
+    let factor: i128 = 10i128.pow(9 - decimals);
+    raw.checked_mul(factor).ok_or(Error::Overflow)
+}
+
+/// Denormalize a 9-decimal internal amount back to the token's native decimals.
+///
+/// The inverse of [`normalize_amount`]. Returns an error if the division
+/// would lose precision (i.e. the result cannot be exactly re-scaled back
+/// to the original value).
+pub fn denormalize_amount(env: &Env, token: &Address, normalized: i128) -> Result<i128, Error> {
+    let decimals: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenDecimals(token.clone()))
+        .ok_or(Error::InvalidToken)?;
+    if decimals == 0 {
+        return Err(Error::InvalidTokenDecimals);
+    }
+    if decimals > 9 {
+        return Err(Error::InvalidInput);
+    }
+    let factor: i128 = 10i128.pow(9 - decimals);
+    let result = normalized.checked_div(factor).ok_or(Error::Overflow)?;
+    // Verify no precision was lost
+    if result.checked_mul(factor).ok_or(Error::Overflow)? != normalized {
+        return Err(Error::InvalidInput);
+    }
+    Ok(result)
 }
 
 #[contracttype]
@@ -1284,7 +1543,7 @@ pub struct BillingStatement {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BillingStatementsPage {
     pub statements: Vec<BillingStatement>,
     pub next_cursor: Option<u32>,
@@ -1503,6 +1762,43 @@ pub struct Coupon {
     pub expires_at: u64,
     /// Set to `true` when the merchant explicitly revokes this coupon.
     pub revoked: bool,
+}
+
+impl Coupon {
+    /// Returns the absolute discount (in token base units) for a gross charge.
+    ///
+    /// Applies `percent_off_bps` first, then `fixed_off`, and clamps the total
+    /// discount to the gross amount so the payable amount never goes negative.
+    pub fn discount_amount(&self, gross: i128) -> i128 {
+        if gross <= 0 {
+            return 0;
+        }
+        let percent_discount = gross
+            .saturating_mul(self.percent_off_bps as i128)
+            .saturating_div(10000_i128);
+        let combined = percent_discount.saturating_add(self.fixed_off);
+        if combined <= 0 {
+            return 0;
+        }
+        if combined >= gross {
+            gross
+        } else {
+            combined
+        }
+    }
+
+    /// Returns `true` if the coupon is not revoked and has not expired.
+    ///
+    /// `expires_at == 0` means the coupon never expires.
+    pub fn is_active(&self, now: u64) -> bool {
+        !self.revoked && (self.expires_at == 0 || now < self.expires_at)
+    }
+
+    /// Returns `true` if the coupon can still be redeemed at `now`.
+    pub fn can_redeem(&self, now: u64, current_redemptions: u32) -> bool {
+        self.is_active(now)
+            && (self.max_redemptions == 0 || current_redemptions < self.max_redemptions)
+    }
 }
 
 /// Event emitted when a merchant creates a new coupon.
@@ -1922,6 +2218,37 @@ pub struct SubscriptionRecoveryReadyEvent {
     pub subscriber: Address,
     pub prepaid_balance: i128,
     pub required_amount: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Emitted when an underfunded interval charge is settled as a partial payment.
+///
+/// The merchant's `allow_partial_payment` policy is enabled, the subscription
+/// had some prepaid balance but less than the full charge, so the available
+/// balance was drained and the uncovered shortfall was added to
+/// `Subscription::arrears`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArrearsAccruedEvent {
+    pub subscription_id: u32,
+    pub partial_amount: i128,
+    pub shortfall: i128,
+    pub total_arrears: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Emitted when a deposit is first applied to outstanding arrears before
+/// topping up the prepaid balance.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArrearsSettledEvent {
+    pub subscription_id: u32,
+    /// Amount of the deposit applied to clear arrears.
+    pub arrears_paid: i128,
+    /// Remaining arrears after this deposit.
+    pub remaining_arrears: i128,
     pub timestamp: u64,
     pub schema_version: u32,
 }
@@ -2475,6 +2802,48 @@ pub struct TreasuryChangeExecutedEvent {
     pub schema_version: u32,
 }
 
+/// A single beneficiary entry in a multi-beneficiary treasury split.
+///
+/// `bps` is in basis points (0–10_000). The sum of all entries in a split
+/// must equal exactly 10_000.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasurySplitEntry {
+    pub beneficiary: Address,
+    pub bps: u32,
+}
+
+/// Multi-beneficiary treasury split configuration stored under
+/// `DataKey::TreasurySplit`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasurySplitConfig {
+    pub entries: soroban_sdk::Vec<TreasurySplitEntry>,
+}
+
+/// Emitted when the admin configures a new treasury split.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TreasurySplitConfiguredEvent {
+    pub admin: Address,
+    pub entries: soroban_sdk::Vec<TreasurySplitEntry>,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Emitted per beneficiary when protocol fees are routed through a treasury
+/// split during a successful charge.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolFeeRoutedEvent {
+    pub subscription_id: u32,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub fee_amount: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProtocolFeeChargedEvent {
@@ -2550,6 +2919,14 @@ pub struct MerchantConfig {
     pub redirect_url: String,
     pub is_paused: bool,
     pub last_updated: u64,
+    /// Per-merchant policy controlling whether underfunded interval charges may
+    /// be settled as a partial payment (draining whatever prepaid balance is
+    /// available and accumulating the shortfall as `Subscription::arrears`).
+    ///
+    /// When `false` (the default), charging preserves the legacy behaviour:
+    /// an underfunded charge moves the subscription into
+    /// `InsufficientBalance`/`GracePeriod` without debiting the prepaid balance.
+    pub allow_partial_payment: bool,
 }
 
 #[contracttype]
@@ -2774,6 +3151,199 @@ pub struct PrepaidQueryResult {
     pub has_more: bool,
 }
 
+// ── Missing types added for compilation compatibility ───────────────────────
+
+/// Accepted token with its decimal precision.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedToken {
+    pub token: Address,
+    pub decimals: u32,
+    pub added_at: u64,
+}
+
+/// Event emitted when the fee-token override is configured.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTokenConfiguredEvent {
+    pub admin: Address,
+    pub fee_token: Option<Address>,
+    pub old_token: Option<Address>,
+    pub new_token: Option<Address>,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a protocol fee is converted through the oracle.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeConvertedEvent {
+    pub subscription_id: u32,
+    pub source_token: Address,
+    pub target_token: Address,
+    pub original_fee_amount: i128,
+    pub converted_fee_amount: i128,
+    pub rate: u128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a subscription is auto-paused due to consecutive failures.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubscriptionAutoPausedEvent {
+    pub subscription_id: u32,
+    pub consecutive_failures: u32,
+    pub threshold: u32,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a subscription is paused.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubscriptionPausedEvent {
+    pub subscription_id: u32,
+    pub authorizer: Address,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Cancellation escrow record for a subscription.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationEscrow {
+    pub subscription_id: u32,
+    pub amount: i128,
+    pub token: Address,
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub opened_at: u64,
+    pub released_at: u64,
+    pub released: bool,
+}
+
+/// Event emitted when a cancellation escrow is opened.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CancellationEscrowOpenedEvent {
+    pub subscription_id: u32,
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub released_at: u64,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a cancellation escrow is disputed.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CancellationEscrowDisputedEvent {
+    pub subscription_id: u32,
+    pub merchant: Address,
+    pub dispute_id: u64,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a cancellation escrow is released.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CancellationEscrowReleasedEvent {
+    pub subscription_id: u32,
+    pub subscriber: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a sub-account is created for a merchant.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubAccountCreatedEvent {
+    pub merchant: Address,
+    pub label: Symbol,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when funds are withdrawn from a sub-account.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubAccountWithdrawEvent {
+    pub merchant: Address,
+    pub label: Symbol,
+    pub amount: i128,
+    pub token: Address,
+    pub remaining_balance: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Oracle price history ring-buffer metadata.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OraclePriceHistoryMeta {
+    pub count: u32,
+    pub cursor: u32,
+}
+
+/// Event emitted when a subscription is transferred.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubscriptionTransferredEvent {
+    pub subscription_id: u32,
+    pub from: Address,
+    pub to: Address,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Transfer intent for subscription transfer flow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferIntent {
+    pub subscription_id: u32,
+    pub from_subscriber: Address,
+    pub from: Address,
+    pub to: Address,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+}
+
+/// Event emitted when a transfer intent is created.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TransferIntentCreatedEvent {
+    pub subscription_id: u32,
+    pub from: Address,
+    pub to: Address,
+    pub expires_at: u64,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a transfer is vetoed.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TransferVetoedEvent {
+    pub subscription_id: u32,
+    pub merchant: Address,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Event emitted when a grace-period buyout is executed.
+// NOTE: GraceBuyoutEvent is already defined above with the canonical fields.
+
+/// Cancellation escrow window in seconds (7 days).
+pub const CANCELLATION_ESCROW_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+
 
 #[cfg(test)]
 mod event_topic_tests {
@@ -2781,7 +3351,9 @@ mod event_topic_tests {
         TOPIC_CAP_REACH, TOPIC_CHARGED, TOPIC_CREATED, TOPIC_DEPOSITED, TOPIC_ONE_OFF_CHARGED,
         TOPIC_RECOVERY, TOPIC_WITHDRAWN,
     };
-    use soroban_sdk::{Env, FromVal, Symbol, ToXdr};
+    use soroban_sdk::{
+        testutils::Events, xdr::ToXdr, Env, FromVal, Symbol,
+    };
 
     /// The emitted wire representation is part of the indexer-facing contract.
     /// Publish every cached short topic in one transaction and compare each
@@ -2812,12 +3384,12 @@ mod event_topic_tests {
 
             assert_eq!(
                 emitted_topic.to_xdr(&env),
-                legacy_topic.to_xdr(&env),
+                legacy_topic.clone().to_xdr(&env),
                 "event topic {name} changed its wire representation"
             );
             assert_eq!(
                 expected_topic.to_xdr(&env),
-                legacy_topic.to_xdr(&env),
+                legacy_topic.clone().to_xdr(&env),
                 "cached topic {name} differs from Symbol::new"
             );
         }
@@ -2831,9 +3403,10 @@ mod event_topic_tests {
         let long_topic = Symbol::new(&env, "subscription_created");
 
         assert_eq!(
-            long_topic.to_xdr(&env),
+            long_topic.clone().to_xdr(&env),
             Symbol::new(&env, "subscription_created").to_xdr(&env)
         );
-        assert_ne!(long_topic.to_xdr(&env), TOPIC_CREATED.to_xdr(&env));
+        assert_ne!(long_topic.clone().to_xdr(&env), TOPIC_CREATED.to_xdr(&env));
     }
 }
+

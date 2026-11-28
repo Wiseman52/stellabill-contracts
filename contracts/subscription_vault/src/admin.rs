@@ -2,13 +2,17 @@
 //!
 //! **PRs that only change admin or batch behavior should edit this file only.**
 
+#[cfg(test)]
+mod tests;
+
 #![allow(dead_code)]
 
 use crate::types::{
     AcceptedToken, AdminConfigChangedEvent, AdminProposal, AdminProposalCancelledEvent,
     AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent, BatchChargeResult,
     DataKey, Error, FeeTokenConfiguredEvent, PendingTreasuryChange, RecoveryEvent, RecoveryReason,
-    TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, TOPIC_RECOVERY, SUB_TTL_EXTEND_TO,
+    TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, TreasurySplitConfig,
+    TreasurySplitConfiguredEvent, TreasurySplitEntry, TOPIC_RECOVERY, SUB_TTL_EXTEND_TO,
     SUB_TTL_THRESHOLD,
 };
 use crate::{
@@ -92,7 +96,7 @@ pub const CONFIG_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 /// collision-free `BytesN<32>` used as the persistent-storage key for the
 /// per-config-key cooldown timestamp.
 fn hash_key_label(env: &Env, key_label: &str) -> soroban_sdk::BytesN<32> {
-    let label_bytes = Bytes::from_array(env, key_label.as_bytes());
+    let label_bytes = Bytes::from_slice(env, key_label.as_bytes());
     env.crypto().sha256(&label_bytes).into()
 }
 
@@ -363,7 +367,7 @@ pub fn list_accepted_tokens(env: &Env) -> Vec<AcceptedToken> {
     let mut out = Vec::new(env);
     for token in tokens.iter() {
         if let Some(decimals) = storage.get::<_, u32>(&accepted_token_decimals_key(&token)) {
-            out.push_back(AcceptedToken { token, decimals });
+            out.push_back(AcceptedToken { token, decimals, added_at: 0 });
         }
     }
     out
@@ -455,6 +459,10 @@ pub fn do_batch_charge(
 }
 
 /// Performs a single interval-based charge. Admin only.
+///
+/// Loads the stored admin from `DataKey::Admin` and requires a valid
+/// authorization signature. Non-admin callers are rejected before any
+/// state mutation occurs.
 pub fn do_charge_subscription(
     env: &Env,
     subscription_id: u32,
@@ -720,7 +728,9 @@ pub fn set_fee_token(
         (Symbol::new(env, "fee_token_configured"),),
         FeeTokenConfiguredEvent {
             admin,
-            fee_token,
+            fee_token: fee_token.clone(),
+            old_token: None,
+            new_token: fee_token,
             timestamp: env.ledger().timestamp(),
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
         },
@@ -736,6 +746,95 @@ pub fn get_fee_token(env: &Env) -> Option<Address> {
 /// Return the configured buyout premium in basis points, defaulting to 0.
 pub fn get_buyout_premium_bps(env: &Env) -> u32 {
     read_config(env, &DataKey::BuyoutPremiumBps).unwrap_or(0u32)
+}
+
+/// Validate a treasury split configuration.
+///
+/// # Validation rules
+/// - Must contain at least one entry.
+/// - No duplicate beneficiary addresses.
+/// - Each `bps` must be > 0.
+/// - The sum of all `bps` values must equal exactly 10_000.
+///
+/// Returns [`Error::InvalidFeeBips`] on any validation failure.
+pub fn validate_treasury_split(entries: &Vec<TreasurySplitEntry>) -> Result<(), Error> {
+    if entries.is_empty() {
+        return Err(Error::InvalidFeeBips);
+    }
+
+    let mut total_bps: u32 = 0;
+    for i in 0..entries.len() {
+        let entry = entries.get(i).unwrap();
+        if entry.bps == 0 {
+            return Err(Error::InvalidFeeBips);
+        }
+        total_bps = total_bps
+            .checked_add(entry.bps)
+            .ok_or(Error::Overflow)?;
+
+        // Check for duplicate beneficiaries
+        for j in (i + 1)..entries.len() {
+            let other = entries.get(j).unwrap();
+            if entry.beneficiary == other.beneficiary {
+                return Err(Error::InvalidFeeBips);
+            }
+        }
+    }
+
+    if total_bps != 10_000 {
+        return Err(Error::InvalidFeeBips);
+    }
+
+    Ok(())
+}
+
+/// Set the multi-beneficiary treasury split. Admin only.
+///
+/// When a treasury split is configured, protocol fees are distributed across
+/// the listed beneficiaries according to their basis-point allocation instead
+/// of being sent to the single `DataKey::Treasury` address.
+///
+/// The sum of all `bps` values must equal exactly 10_000. Duplicate
+/// beneficiaries are rejected.
+pub fn set_treasury_split(
+    env: &Env,
+    admin: Address,
+    entries: Vec<TreasurySplitEntry>,
+) -> Result<(), Error> {
+    require_admin_auth(env, &admin)?;
+    enforce_config_cooldown(env, "TreasurySplit")?;
+
+    validate_treasury_split(&entries)?;
+
+    let config = TreasurySplitConfig {
+        entries: entries.clone(),
+    };
+    write_config(env, &DataKey::TreasurySplit, &config);
+
+    env.events().publish(
+        (Symbol::new(env, "treasury_split_configured"),),
+        TreasurySplitConfiguredEvent {
+            admin,
+            entries,
+            timestamp: env.ledger().timestamp(),
+            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+        },
+    );
+    Ok(())
+}
+
+/// Return the configured treasury split, or `None` if not set.
+pub fn get_treasury_split(env: &Env) -> Option<TreasurySplitConfig> {
+    read_config(env, &DataKey::TreasurySplit)
+}
+
+/// Clear the treasury split, reverting protocol fees to the single-treasury
+/// address stored in `DataKey::Treasury`. Admin only.
+pub fn clear_treasury_split(env: &Env, admin: Address) -> Result<(), Error> {
+    require_admin_auth(env, &admin)?;
+    enforce_config_cooldown(env, "TreasurySplit")?;
+    remove_config(env, &DataKey::TreasurySplit);
+    Ok(())
 }
 
 /// Set the auto-pause threshold (number of consecutive InsufficientBalance failures
@@ -862,6 +961,134 @@ pub fn get_auto_pause_threshold(env: &Env) -> u32 {
         .unwrap_or(0u32)
 }
 
+#[cfg(test)]
+mod rotate_admin_adversarial_tests {
+    use crate::{types::DataKey, Error, SubscriptionVault, SubscriptionVaultClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Address, Env,
+    };
+
+    fn setup() -> (Env, SubscriptionVaultClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        client.init(&token, &6, &admin, &1_000_000i128, &(7 * 24 * 60 * 60));
+
+        (env, client, admin)
+    }
+
+    fn admin_nonce(env: &Env, contract_id: &Address, signer: &Address) -> u64 {
+        env.as_contract(contract_id, || {
+            crate::nonce::get_nonce(env, signer, crate::nonce::DOMAIN_ADMIN_ROTATION)
+        })
+    }
+
+    #[test]
+    fn successful_rotation_updates_admin_and_consumes_nonce() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+
+        client.rotate_admin(&admin, &new_admin, &0);
+
+        assert_eq!(client.get_admin(), new_admin);
+        assert_eq!(admin_nonce(&env, &client.address, &admin), 1);
+    }
+
+    #[test]
+    fn rejected_callers_and_targets_leave_nonce_available() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(
+            client.try_rotate_admin(&stranger, &new_admin, &0),
+            Err(Ok(Error::Forbidden))
+        );
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(admin_nonce(&env, &client.address, &admin), 0);
+
+        assert_eq!(
+            client.try_rotate_admin(&admin, &admin, &0),
+            Err(Ok(Error::SelfRotation))
+        );
+        assert_eq!(
+            client.try_rotate_admin(&admin, &client.address, &0),
+            Err(Ok(Error::InvalidNewAdmin))
+        );
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(admin_nonce(&env, &client.address, &admin), 0);
+
+        client.rotate_admin(&admin, &new_admin, &0);
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    fn skipped_nonce_is_rejected_without_changing_state() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(
+            client.try_rotate_admin(&admin, &new_admin, &1),
+            Err(Ok(Error::NonceAlreadyUsed))
+        );
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(admin_nonce(&env, &client.address, &admin), 0);
+
+        client.rotate_admin(&admin, &new_admin, &0);
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    fn maximum_nonce_overflow_does_not_change_admin_or_nonce() {
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &DataKey::AdminNonce(admin.clone(), crate::nonce::DOMAIN_ADMIN_ROTATION),
+                &u64::MAX,
+            );
+        });
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(
+            client.try_rotate_admin(&admin, &new_admin, &u64::MAX),
+            Err(Ok(Error::Overflow))
+        );
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(admin_nonce(&env, &client.address, &admin), u64::MAX);
+    }
+
+    #[test]
+    fn cooldown_rejection_rolls_back_nonce_and_allows_retry_after_boundary() {
+        let (env, client, admin) = setup();
+        let next_admin = Address::generate(&env);
+        let final_admin = Address::generate(&env);
+
+        client.rotate_admin(&admin, &next_admin, &0);
+        assert_eq!(client.get_admin(), next_admin);
+
+        assert_eq!(
+            client.try_rotate_admin(&next_admin, &final_admin, &0),
+            Err(Ok(Error::CooldownActive))
+        );
+        assert_eq!(client.get_admin(), next_admin);
+        assert_eq!(admin_nonce(&env, &client.address, &next_admin), 0);
+
+        env.ledger().set_timestamp(1_000_000 + CONFIG_COOLDOWN_SECS);
+        client.rotate_admin(&next_admin, &final_admin, &0);
+        assert_eq!(client.get_admin(), final_admin);
+        assert_eq!(admin_nonce(&env, &client.address, &next_admin), 1);
+    }
+}
+
 // ── Schema migration ──────────────────────────────────────────────────────────
 
 pub fn rewrite_subscriptions_for_ledger_expiration(env: &Env) -> u32 {
@@ -903,6 +1130,33 @@ pub fn rewrite_subscriptions_for_sub_account_label(env: &Env) -> u32 {
         {
             // Round-trip: deserialise populates `sub_account_label: None`,
             // then write back so XDR encoding includes the new field.
+            env.storage().persistent().set(&key, &sub);
+            env.storage().persistent().extend_ttl(
+                &key,
+                SUB_TTL_THRESHOLD,
+                SUB_TTL_EXTEND_TO,
+            );
+            touched = touched.saturating_add(1);
+        }
+    }
+    touched
+}
+
+/// v5 → v6 migration: rewrite every `DataKey::Sub(id)` record so the new
+/// trailing `arrears: i128` field deserializes cleanly for subscriptions
+/// created before STORAGE_VERSION 6. The in-memory struct already carries
+/// `arrears: 0` after the deserialization round-trip, so a read-write of each
+/// record is sufficient to persist the new field in the XDR encoding.
+pub fn rewrite_subscriptions_for_arrears(env: &Env) -> u32 {
+    let next_id: u32 = read_config(env, &DataKey::NextId).unwrap_or(0);
+    let mut touched = 0u32;
+    for id in 0..next_id {
+        let key = DataKey::Sub(id);
+        if let Some(sub) = env
+            .storage()
+            .persistent()
+            .get::<_, crate::types::Subscription>(&key)
+        {
             env.storage().persistent().set(&key, &sub);
             env.storage().persistent().extend_ttl(
                 &key,
@@ -1080,6 +1334,13 @@ pub fn do_migrate(
                 rewrite_subscriptions_for_sub_account_label(env);
                 current = 5;
             }
+            // v5 → v6: rewrite every `DataKey::Sub(id)` record so the new
+            // trailing `arrears: i128` field deserializes cleanly for
+            // subscriptions created before STORAGE_VERSION 6.
+            (5, _) => {
+                rewrite_subscriptions_for_arrears(env);
+                current = 6;
+            }
             _ => {
                 current += 1;
             }
@@ -1117,4 +1378,306 @@ pub fn do_migrate(
     );
 
     Ok(())
+}
+
+/// Adversarial coverage for [`rewrite_subscriptions_for_arrears`].
+///
+/// The migration helper is a pure read-write round-trip over every
+/// `DataKey::Sub(id)` record in `0..NextId`: it must (a) rewrite exactly the
+/// records that exist, (b) report a deterministic touched-count, (c) never
+/// mutate the data it round-trips (including out-of-range `arrears` values it
+/// is not responsible for validating), and (d) leave storage untouched when the
+/// admin-gated entrypoint that drives it rejects the caller.
+#[cfg(test)]
+mod rewrite_subscriptions_for_arrears_tests {
+    use super::*;
+    use crate::test_utils::setup::TestEnv;
+    use crate::types::{Subscription, SubscriptionStatus};
+    use soroban_sdk::testutils::Address as _;
+
+    /// Build a fully-populated subscription record so any field dropped by the
+    /// round-trip fails the equality assertion.
+    fn make_sub(env: &Env, arrears: i128) -> Subscription {
+        Subscription {
+            subscriber: Address::generate(env),
+            merchant: Address::generate(env),
+            token: Address::generate(env),
+            amount: 10_000_000,
+            interval_seconds: 2_592_000,
+            last_payment_timestamp: 1_700_000_000,
+            status: SubscriptionStatus::Active,
+            prepaid_balance: 5_000_000,
+            usage_enabled: false,
+            lifetime_cap: Some(100_000_000),
+            lifetime_charged: 3_000_000,
+            start_time: 1_699_000_000,
+            expires_at: Some(1_800_000_000),
+            grace_start_timestamp: None,
+            cancel_at: None,
+            expires_at_ledger: None,
+            sub_account_label: None,
+            auto_renew: true,
+            auto_renew_disabled_at: None,
+            arrears,
+        }
+    }
+
+    fn seed_sub(te: &TestEnv, id: u32, sub: &Subscription) {
+        te.env.as_contract(&te.client.address, || {
+            te.env.storage().persistent().set(&DataKey::Sub(id), sub);
+        });
+    }
+
+    fn seed_next_id(te: &TestEnv, next_id: u32) {
+        te.env.as_contract(&te.client.address, || {
+            te.env
+                .storage()
+                .persistent()
+                .set(&DataKey::NextId, &next_id);
+        });
+    }
+
+    fn clear_next_id(te: &TestEnv) {
+        te.env.as_contract(&te.client.address, || {
+            te.env.storage().persistent().remove(&DataKey::NextId);
+        });
+    }
+
+    fn read_sub(te: &TestEnv, id: u32) -> Option<Subscription> {
+        te.env.as_contract(&te.client.address, || {
+            te.env.storage().persistent().get(&DataKey::Sub(id))
+        })
+    }
+
+    fn read_schema_version(te: &TestEnv) -> Option<u32> {
+        te.env.as_contract(&te.client.address, || {
+            te.env
+                .storage()
+                .persistent()
+                .get(&DataKey::SchemaVersion)
+        })
+    }
+
+    fn rewrite(te: &TestEnv) -> u32 {
+        te.env.as_contract(&te.client.address, || {
+            rewrite_subscriptions_for_arrears(&te.env)
+        })
+    }
+
+    /// Valid call: every present record is rewritten in place and the return
+    /// value equals the number of records visited.
+    #[test]
+    fn rewrite_arrears_rewrites_each_record_and_returns_count() {
+        let te = TestEnv::default();
+        let sub0 = make_sub(&te.env, 0);
+        let sub1 = make_sub(&te.env, 1_000_000);
+        let sub2 = make_sub(&te.env, i128::MAX);
+        seed_sub(&te, 0, &sub0);
+        seed_sub(&te, 1, &sub1);
+        seed_sub(&te, 2, &sub2);
+        seed_next_id(&te, 3);
+
+        assert_eq!(rewrite(&te), 3);
+
+        // Full-record equality proves the round-trip preserved every field,
+        // not just `arrears`.
+        assert_eq!(read_sub(&te, 0), Some(sub0));
+        assert_eq!(read_sub(&te, 1), Some(sub1));
+        assert_eq!(read_sub(&te, 2), Some(sub2));
+    }
+
+    /// Empty subscription set (both "NextId absent" and "NextId == 0") is a
+    /// safe no-op: zero touched and no synthetic records written.
+    #[test]
+    fn rewrite_arrears_empty_set_returns_zero_and_creates_no_records() {
+        let te = TestEnv::default();
+
+        clear_next_id(&te);
+        assert_eq!(rewrite(&te), 0);
+        assert_eq!(read_sub(&te, 0), None);
+
+        seed_next_id(&te, 0);
+        assert_eq!(rewrite(&te), 0);
+        assert_eq!(read_sub(&te, 0), None);
+    }
+
+    /// Non-existent ids inside `0..NextId` are skipped without panicking and
+    /// without creating placeholder records.
+    #[test]
+    fn rewrite_arrears_skips_absent_ids_in_sparse_range() {
+        let te = TestEnv::default();
+        let sub1 = make_sub(&te.env, 7);
+        let sub4 = make_sub(&te.env, 9);
+        seed_sub(&te, 1, &sub1);
+        seed_sub(&te, 4, &sub4);
+        seed_next_id(&te, 5);
+
+        assert_eq!(rewrite(&te), 2);
+        assert_eq!(read_sub(&te, 0), None);
+        assert_eq!(read_sub(&te, 1), Some(sub1));
+        assert_eq!(read_sub(&te, 2), None);
+        assert_eq!(read_sub(&te, 3), None);
+        assert_eq!(read_sub(&te, 4), Some(sub4));
+    }
+
+    /// The loop bound is `NextId`: a record whose id is at or above the stored
+    /// counter is not rewritten, but it is also not deleted or mutated.
+    #[test]
+    fn rewrite_arrears_ignores_ids_at_or_above_next_id() {
+        let te = TestEnv::default();
+        let sub0 = make_sub(&te.env, 1);
+        let sub1 = make_sub(&te.env, 2);
+        let sub2 = make_sub(&te.env, 3);
+        seed_sub(&te, 0, &sub0);
+        seed_sub(&te, 1, &sub1);
+        seed_sub(&te, 2, &sub2);
+        seed_next_id(&te, 2);
+
+        assert_eq!(rewrite(&te), 2);
+        assert_eq!(read_sub(&te, 0), Some(sub0));
+        assert_eq!(read_sub(&te, 1), Some(sub1));
+        assert_eq!(read_sub(&te, 2), Some(sub2));
+    }
+
+    /// A record that is already up to date (`arrears == 0`) is still rewritten
+    /// and counted; running the migration twice is idempotent and stable.
+    #[test]
+    fn rewrite_arrears_is_idempotent_when_already_up_to_date() {
+        let te = TestEnv::default();
+        let sub = make_sub(&te.env, 0);
+        seed_sub(&te, 0, &sub);
+        seed_next_id(&te, 1);
+
+        assert_eq!(rewrite(&te), 1);
+        assert_eq!(read_sub(&te, 0), Some(sub.clone()));
+
+        assert_eq!(rewrite(&te), 1);
+        assert_eq!(read_sub(&te, 0), Some(sub));
+    }
+
+    /// Boundary values are round-tripped byte-for-byte: the helper is a
+    /// migration, not a validator, so it must not clamp or normalise `arrears`.
+    #[test]
+    fn rewrite_arrears_preserves_extreme_values_without_clamping() {
+        let te = TestEnv::default();
+        let min = make_sub(&te.env, i128::MIN);
+        let max = make_sub(&te.env, i128::MAX);
+        seed_sub(&te, 0, &min);
+        seed_sub(&te, 1, &max);
+        seed_next_id(&te, 2);
+
+        assert_eq!(rewrite(&te), 2);
+        assert_eq!(read_sub(&te, 0).map(|s| s.arrears), Some(i128::MIN));
+        assert_eq!(read_sub(&te, 1).map(|s| s.arrears), Some(i128::MAX));
+    }
+
+    /// The admin-gated `migrate` entrypoint drives the v5 → v6 arrears rewrite
+    /// and advances the stored schema version to the binary's version.
+    #[test]
+    fn migrate_from_v5_rewrites_arrears_and_advances_schema() {
+        let te = TestEnv::default();
+        let sub0 = make_sub(&te.env, 0);
+        let sub1 = make_sub(&te.env, 42);
+        seed_sub(&te, 0, &sub0);
+        seed_sub(&te, 1, &sub1);
+        seed_next_id(&te, 2);
+        te.env.as_contract(&te.client.address, || {
+            te.env
+                .storage()
+                .persistent()
+                .set(&DataKey::SchemaVersion, &5u32);
+        });
+
+        te.client.migrate(&te.admin);
+
+        assert_eq!(read_schema_version(&te), Some(crate::STORAGE_VERSION));
+        assert_eq!(read_sub(&te, 0), Some(sub0));
+        assert_eq!(read_sub(&te, 1), Some(sub1));
+    }
+
+    /// A non-admin caller is authenticated (auth is mocked) but rejected with
+    /// `Forbidden`, and storage is left exactly as it was — the rewrite never
+    /// runs and the schema version is not advanced.
+    #[test]
+    fn migrate_rejects_non_admin_and_leaves_storage_untouched() {
+        let te = TestEnv::default();
+        let sub0 = make_sub(&te.env, 123);
+        seed_sub(&te, 0, &sub0);
+        seed_next_id(&te, 1);
+        te.env.as_contract(&te.client.address, || {
+            te.env
+                .storage()
+                .persistent()
+                .set(&DataKey::SchemaVersion, &5u32);
+        });
+
+        let attacker = Address::generate(&te.env);
+        assert_eq!(te.client.try_migrate(&attacker), Err(Ok(Error::Forbidden)));
+
+        assert_eq!(read_schema_version(&te), Some(5u32));
+        assert_eq!(read_sub(&te, 0), Some(sub0));
+    }
+
+    /// Same rejection observed through the panicking client path, pinning the
+    /// contract error discriminant (#1002 `Forbidden`).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1002)")]
+    fn migrate_panics_forbidden_for_non_admin_caller() {
+        let te = TestEnv::default();
+        let attacker = Address::generate(&te.env);
+        te.client.migrate(&attacker);
+    }
+}
+
+#[cfg(test)]
+mod get_protocol_fee_bps_tests {
+    use super::*;
+    use crate::test_utils::setup::TestEnv;
+
+    #[test]
+    fn returns_zero_when_unset() {
+        let te = TestEnv::default();
+        te.env.as_contract(&te.client.address, || {
+            // Nothing set yet, should default to 0
+            assert_eq!(get_protocol_fee_bps(&te.env), 0);
+        });
+    }
+
+    #[test]
+    fn returns_configured_value() {
+        let te = TestEnv::default();
+        let expected_fee = 500u32;
+        
+        te.env.as_contract(&te.client.address, || {
+            write_config(&te.env, &DataKey::FeeBps, &expected_fee);
+            assert_eq!(get_protocol_fee_bps(&te.env), expected_fee);
+        });
+    }
+
+    #[test]
+    fn returns_boundary_value_max() {
+        let te = TestEnv::default();
+        let expected_fee = u32::MAX;
+        
+        te.env.as_contract(&te.client.address, || {
+            write_config(&te.env, &DataKey::FeeBps, &expected_fee);
+            assert_eq!(get_protocol_fee_bps(&te.env), expected_fee);
+        });
+    }
+
+    #[test]
+    fn read_only_does_not_alter_storage() {
+        let te = TestEnv::default();
+        te.env.as_contract(&te.client.address, || {
+            // Record initial storage state
+            let initial_count = te.env.storage().persistent().has(&DataKey::FeeBps);
+            
+            // Perform the read
+            let fee = get_protocol_fee_bps(&te.env);
+            
+            // Verify state is unchanged
+            assert_eq!(fee, 0);
+            assert_eq!(te.env.storage().persistent().has(&DataKey::FeeBps), initial_count);
+        });
+    }
 }

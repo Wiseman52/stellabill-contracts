@@ -261,6 +261,152 @@ fn test_cancel_then_repropose_works() {
     assert_eq!(proposal.new_admin, second);
 }
 
+// ── cancel_admin_proposal — additional adversarial and boundary coverage ─────
+
+/// Double-cancel: after the first cancel removes the proposal, a second
+/// cancel by the same admin must return `NoActiveProposal` and must not
+/// alter any state.
+#[test]
+fn test_cancel_admin_proposal_double_cancel_rejected() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+    client.cancel_admin_proposal(&admin);
+
+    let result = client.try_cancel_admin_proposal(&admin);
+    assert_eq!(result, Err(Ok(Error::NoActiveProposal)));
+    // Admin is still the original admin and no proposal exists.
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.get_admin_proposal().is_none());
+}
+
+/// The pending `new_admin` is not the stored admin, so they cannot cancel —
+/// only the current admin holds that privilege.
+#[test]
+fn test_cancel_admin_proposal_proposed_address_cannot_cancel() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // `new_admin` is the proposed address but is NOT the current admin.
+    let result = client.try_cancel_admin_proposal(&new_admin);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    // Proposal is still live.
+    assert!(client.get_admin_proposal().is_some());
+}
+
+/// Cancelling a proposal whose window has already elapsed is still valid —
+/// the function must not check expiry, only whether a proposal exists.
+#[test]
+fn test_cancel_admin_proposal_after_window_elapsed_succeeds() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+    // Advance past the 7-day window.
+    advance_seconds(&env, 7 * 24 * 60 * 60 + 1);
+
+    // Cancel must succeed even though the proposal is expired.
+    client.cancel_admin_proposal(&admin);
+
+    assert!(client.get_admin_proposal().is_none());
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// After cancellation, the intended claimant can no longer claim the role
+/// and the admin address remains unchanged.
+#[test]
+fn test_cancel_admin_proposal_blocks_subsequent_claim() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+    client.cancel_admin_proposal(&admin);
+
+    let result = client.try_claim_admin_role(&new_admin);
+    assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// State invariant: a successful cancel must leave the stored admin address
+/// exactly as it was before the proposal was created.
+#[test]
+fn test_cancel_admin_proposal_admin_address_unchanged() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    let admin_before = client.get_admin();
+    client.propose_admin(&admin, &new_admin);
+    client.cancel_admin_proposal(&admin);
+    let admin_after = client.get_admin();
+
+    assert_eq!(admin_before, admin_after);
+}
+
+/// The event payload must carry the correct admin address and a timestamp
+/// equal to the ledger time at the moment of cancellation.
+#[test]
+fn test_cancel_admin_proposal_event_payload() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+    // Advance time so the cancel timestamp differs from proposal time.
+    advance_seconds(&env, 3600);
+    client.cancel_admin_proposal(&admin);
+
+    let payload =
+        find_event_data(&env, &Symbol::new(&env, "admin_proposal_cancelled")).unwrap();
+    let parsed = AdminProposalCancelledEvent::try_from_val(&env, &payload).unwrap();
+    assert_eq!(parsed.admin, admin);
+    assert_eq!(parsed.timestamp, 1_000_000 + 3600);
+}
+
+/// After a single-step rotation the former admin is no longer the stored
+/// admin and must be rejected when they attempt to cancel a proposal that
+/// the new admin created.
+#[test]
+fn test_cancel_admin_proposal_former_admin_rejected_after_rotation() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+    let third = Address::generate(&env);
+
+    // Rotate directly (single-step) so `admin` loses the role.
+    client.rotate_admin(&admin, &new_admin, &0);
+    assert_eq!(client.get_admin(), new_admin);
+
+    // New admin creates a proposal.
+    client.propose_admin(&new_admin, &third);
+
+    // Former admin attempts to cancel — must be rejected.
+    let result = client.try_cancel_admin_proposal(&admin);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    // Proposal is still intact.
+    assert!(client.get_admin_proposal().is_some());
+}
+
+/// Cancel → repropose → cancel again: the contract must handle repeated
+/// create/cancel cycles without accumulating stale state.
+#[test]
+fn test_cancel_admin_proposal_multiple_cycles() {
+    let (env, client, _token, admin) = setup();
+
+    for _ in 0..3 {
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        assert!(client.get_admin_proposal().is_some());
+        client.cancel_admin_proposal(&admin);
+        assert!(client.get_admin_proposal().is_none());
+    }
+
+    // Admin is unchanged after three full cycles.
+    assert_eq!(client.get_admin(), admin);
+}
+
 // ── get_admin_proposal ───────────────────────────────────────────────────────
 
 #[test]
@@ -366,8 +512,41 @@ fn test_old_rotate_admin_still_works() {
     let (env, client, _token, admin) = setup();
     let new_admin = Address::generate(&env);
 
-    client.rotate_admin(&admin, &new_admin);
+    client.rotate_admin(&admin, &new_admin, &0);
     assert_eq!(client.get_admin(), new_admin);
+}
+
+#[test]
+fn test_rotate_admin_rejects_skipped_nonce() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    let result = client.try_rotate_admin(&admin, &new_admin, &1);
+    assert_eq!(result, Err(Ok(Error::NonceAlreadyUsed)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_rotate_admin_accepts_current_nonce_after_rejected_skip() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    let result = client.try_rotate_admin(&admin, &new_admin, &1);
+    assert_eq!(result, Err(Ok(Error::NonceAlreadyUsed)));
+
+    client.rotate_admin(&admin, &new_admin, &0);
+    assert_eq!(client.get_admin(), new_admin);
+}
+
+#[test]
+fn test_rotate_admin_nonce_is_per_signer() {
+    let (env, client, _token, admin) = setup();
+    let admin2 = Address::generate(&env);
+    let admin3 = Address::generate(&env);
+
+    client.rotate_admin(&admin, &admin2, &0);
+    client.rotate_admin(&admin2, &admin3, &0);
+    assert_eq!(client.get_admin(), admin3);
 }
 
 #[test]
@@ -377,7 +556,7 @@ fn test_proposal_cannot_be_claimed_by_old_admin_after_immediate_rotation() {
 
     client.propose_admin(&admin, &new_admin);
     // Use old single-step to rotate directly instead
-    client.rotate_admin(&admin, &new_admin);
+    client.rotate_admin(&admin, &new_admin, &0);
     // Claim is no longer needed; proposal is stale
     // However, the proposal still exists since we didn't cancel it.
     // But admin is already new_admin, and the proposal was for them.
